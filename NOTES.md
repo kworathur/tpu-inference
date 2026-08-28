@@ -12,6 +12,8 @@ Bug #1: Dimension mis-match in the attention module where the the query 2D matri
 
 Fairly certain this is NOT related to FP8 quantization but could be related to DeepSeek v2 being an MoE model.
 
+No, it is due to DeepSeek's attention mechanism (multi-head latent attention) concatenating RoPE query to each query (this concatenation cannot be represented with only two dims). Why do we need to perform concatenation - why can't we apply RoPE to the query itself?
+
 Bug #2: Another dimension mis-match in the fused MoE kernel that is common to all models.
 
 Caused by DeepSeek using k=6 experts in its MoE architecture, which means matrix dims are not multiples of 128.
