@@ -40,7 +40,9 @@ cleanup_docker_resource() {
 
   # Iterate and cleanup
   for IMG in "${TARGET_IMAGES[@]}"; do
-    echo "----------------------------------------"
+    # Not "---...": Buildkite reads a leading `---` as a log group header, so a
+    # plain dashed rule silently opens an anonymous group per image.
+    echo "========================================"
     echo "Starting cleanup for ${IMG}"
 
     # Use format to get "Repository ID" and use awk for exact or suffix matching.
@@ -65,8 +67,10 @@ cleanup_docker_resource() {
       fi
       
       echo "Removing old ${IMG} image(s) by ID..."
-      # Using ID directly ensures all tags of that specific image are untagged and removed
-      echo "$OLD_IMAGES" | xargs -r docker rmi -f
+      # Using ID directly ensures all tags of that specific image are untagged and removed.
+      # Output is one "Untagged:"/"Deleted:" line per layer -- dozens of lines of
+      # sha256 noise per run, with nothing actionable in them.
+      echo "$OLD_IMAGES" | xargs -r docker rmi -f >/dev/null
     else
       echo "No images matching ${IMG} found to clean up."
     fi
@@ -201,10 +205,13 @@ setup_environment() {
   # ==========================================
   if [[ "${USE_PREBUILT_IMAGE:-0}" == "1" ]]; then
     echo "Pulling pre-built Docker image: ${CI_IMAGE_REPO}:${CACHE_TAG} ..."
-    docker pull "${CI_IMAGE_REPO}:${CACHE_TAG}"
+    # -q: the layer-by-layer pull progress is several hundred lines per job.
+    docker pull -q "${CI_IMAGE_REPO}:${CACHE_TAG}"
     verify_image_vllm "${CI_IMAGE_REPO}:${CACHE_TAG}" "${VLLM_COMMIT_HASH}"
     docker tag "${CI_IMAGE_REPO}:${CACHE_TAG}" "${IMAGE_NAME}:${TPU_INFERENCE_HASH}"
     docker tag "${CI_IMAGE_REPO}:${CACHE_TAG}" "${IMAGE_NAME}:latest"
+    # Export the computed CI cache image name so calling scripts can use it.
+    export EXPORTED_CI_CACHE_IMAGE="${CI_IMAGE_REPO}:${CACHE_TAG}"
     return 0
   fi
 
@@ -229,6 +236,7 @@ setup_environment() {
     echo "Pushing Docker image to CI Image Registry..."
     docker tag "${IMAGE_NAME}:${CACHE_TAG}" "${CI_IMAGE_REPO}:${CACHE_TAG}"
     docker push "${CI_IMAGE_REPO}:${CACHE_TAG}"
+    export EXPORTED_CI_CACHE_IMAGE="${CI_IMAGE_REPO}:${CACHE_TAG}"
   fi
 
   # Push logic if requested
@@ -237,5 +245,13 @@ setup_environment() {
     gcloud auth configure-docker us-central1-docker.pkg.dev
     docker push "${IMAGE_NAME}:${TPU_INFERENCE_HASH}"
     docker push "${IMAGE_NAME}:latest"
+  fi
+
+  # Only clean up resources in setup_environment after pushing to a remote registry
+  # (e.g., standalone builder jobs in CI). When building locally to run on the same machine
+  # (push_to_ci_cache=false and should_push=false), preserve the image so the caller can run it.
+  if [[ "$push_to_ci_cache" == "true" || "$should_push" == "true" ]]; then
+    echo "--- Cleaning up Docker resources after push..."
+    cleanup_docker_resource "${IMAGE_NAME}"
   fi
 }

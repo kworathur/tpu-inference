@@ -33,8 +33,7 @@ from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import (JaxEinsum, JaxLinear, JaxLmHead,
-                                             JaxMergedColumnParallelLinear,
-                                             JaxQKVParallelLinear)
+                                             JaxMergedColumnParallelLinear)
 from tpu_inference.layers.jax.moe.moe import JaxRoutedExperts
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
@@ -198,42 +197,34 @@ class Gemma4MoE(JaxRoutedExperts):
     def load_weights(self, weights: Iterable):
         """Load weights for Gemma4 MoE layer.
 
-        Unlike other MoE, Gemma4 didn't provide per-expert weights, but
-        already consolidates each projection weights into a single tensor
-        stacked along the expert axis
-        — e.g. `down_proj` is `(E, D, F)` rather than separate
-        per-expert `(D, F)` tensors in. The generic per-expert loader
-        (`JaxMoE._load_weights` / `Fp8FusedMoEMethod.load_weights`) expects
-        the latter, keyed as `"<expert_id>.<param_name>"`. Slice each stacked
-        tensor into per-expert pieces and synthesize that naming, then
-        delegate to super().
-
-        Per-expert slices are handed over as-is (no transpose): the generic
-        loader does no permute itself (just adds the expert dim back via
-        reshape), and `*FusedMoEMethod.process_weights_after_loading`
-        concatenates gate/up scale halves along the same axis it
-        concatenates the gate/up weight halves — so the checkpoint's native
-        per-expert orientation already lines up for both weights and their
-        scales, for the same reason the un-permuted raw weights do.
+        See https://github.com/vllm-project/vllm/blob/979f5511d78b317760d45df9290233c27793a0af/vllm/model_executor/models/gemma4.py#L1640-L1694
         """
+        weight_list = list(weights)
 
-        def per_expert_slice(stacked_tensor, param_name: str):
-            return ((f"{i}.{param_name}", expert_tensor)
-                    for i, expert_tensor in enumerate(stacked_tensor))
+        is_fused = any(
+            n.endswith("gate_up_proj") or n.endswith("down_proj")
+            for n, _ in weight_list)
 
-        synthesized = []
-        for name, tensor in weights:
-            if name.endswith("down_proj"):
-                synthesized.extend(per_expert_slice(tensor,
-                                                    "down_proj.weight"))
-            elif name.endswith("gate_up_proj"):
-                F = tensor.shape[1] // 2
-                synthesized.extend(
-                    per_expert_slice(tensor[:, :F, :], "gate_proj.weight"))
-                synthesized.extend(
-                    per_expert_slice(tensor[:, F:, :], "up_proj.weight"))
+        if is_fused:
+            synthesized = []
+            for name, tensor in weight_list:
+                if name.endswith("down_proj"):
+                    for i, shard in enumerate(tensor):
+                        synthesized.append((f"{i}.down_proj.weight", shard))
+                elif name.endswith("gate_up_proj"):
+                    F = tensor.shape[1] // 2
+                    for i, shard in enumerate(tensor[:, :F, :]):
+                        synthesized.append((f"{i}.gate_proj.weight", shard))
+                    for i, shard in enumerate(tensor[:, F:, :]):
+                        synthesized.append((f"{i}.up_proj.weight", shard))
+            return super().load_weights(synthesized)
 
-        return super().load_weights(synthesized)
+        # Per-expert format: strip the "experts." prefix added during routing so
+        # downstream loaders see bare "N.proj.param" names as they expect.
+        _PREFIX = "experts."
+        stripped = ((name[len(_PREFIX):] if name.startswith(_PREFIX) else name,
+                     w) for name, w in weight_list)
+        return super().load_weights(stripped)
 
 
 class Gemma4Attention(JaxModule):
@@ -246,10 +237,12 @@ class Gemma4Attention(JaxModule):
                  mesh: Mesh,
                  kv_cache_dtype: str,
                  quant_config: VllmQuantConfig,
+                 decode_query_size: int = 1,
                  prefix: str = ""):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.rms_norm_eps = config.rms_norm_eps
+        self.decode_query_size = decode_query_size
 
         # Assuming Gemma 4 also uses a custom scalar, not 1/sqrt(head_dim)
         self.scaling = 1.0
@@ -284,21 +277,16 @@ class Gemma4Attention(JaxModule):
             self.rope_scaling = getattr(config, "rope_scaling", None)
             self.rope_proportion = 0.25 if not self.is_sliding else 1.0
 
-        # Gemma4: use different num_kv_heads and head_dim in GLOBAL/LOCAL layers
-        if not self.is_sliding:
-            # GLOBAL layers
-            self.head_dim_original = config.global_head_dim
-        else:
-            # LOCAL layers
-            self.head_dim_original = config.head_dim
+        # Gemma4: use different num_kv_heads and head_dim in GLOBAL/LOCAL
+        # layers. transformers >= 5.15 stores both per layer; older versions
+        # use flat attributes split by layer_types (see
+        # utils.get_layer_kv_params).
+        self.head_dim_original, self.num_kv_heads = utils.get_layer_kv_params(
+            config, self.layer_type)
 
         # Determine if this full-attention layer uses k_eq_v
         use_k_eq_v = ((not self.is_sliding)
                       and getattr(config, "attention_k_eq_v", False))
-        if use_k_eq_v:
-            self.num_kv_heads = config.num_global_key_value_heads or config.num_key_value_heads
-        else:
-            self.num_kv_heads = config.num_key_value_heads
 
         self.head_dim = utils.get_padded_head_dim(self.head_dim_original)
 
@@ -322,23 +310,36 @@ class Gemma4Attention(JaxModule):
                            None) if _shard_kv_on_k else (None, None, "model")
         _kv_bias_spec = ("model", None) if _shard_kv_on_k else (None, "model")
 
+        self.q_proj = JaxEinsum(
+            "TD,DNH->TNH",
+            (self.hidden_size, self.num_heads, self.head_dim),
+            bias_shape=(self.num_heads,
+                        self.head_dim) if config.attention_bias else None,
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
+            bias_init=nnx.with_partitioning(init_fn, ("model", None))
+            if config.attention_bias else None,
+            rngs=rng,
+            quant_config=quant_config,
+            prefix=prefix + ".q_proj",
+        )
+        self.k_proj = JaxEinsum(
+            "TD,DKH->TKH",
+            (self.hidden_size, self.num_kv_heads, self.head_dim),
+            bias_shape=(self.num_kv_heads,
+                        self.head_dim) if config.attention_bias else None,
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, _kv_kernel_spec),
+            bias_init=nnx.with_partitioning(init_fn, _kv_bias_spec)
+            if config.attention_bias else None,
+            rngs=rng,
+            quant_config=quant_config,
+            prefix=prefix + ".k_proj",
+        )
         if use_k_eq_v:  # TODO: Add QKV fusion logic for k == v case.
-            self.qkv_proj = None
-            self.q_proj = JaxEinsum(
-                "TD,DNH->TNH",
-                (self.hidden_size, self.num_heads, self.head_dim),
-                bias_shape=(self.num_heads,
-                            self.head_dim) if config.attention_bias else None,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(init_fn,
-                                                  (None, "model", None)),
-                bias_init=nnx.with_partitioning(init_fn, ("model", None))
-                if config.attention_bias else None,
-                rngs=rng,
-                quant_config=quant_config,
-                prefix=prefix + ".q_proj",
-            )
-            self.k_proj = JaxEinsum(
+            self.v_proj = None
+        else:
+            self.v_proj = JaxEinsum(
                 "TD,DKH->TKH",
                 (self.hidden_size, self.num_kv_heads, self.head_dim),
                 bias_shape=(self.num_kv_heads,
@@ -349,24 +350,8 @@ class Gemma4Attention(JaxModule):
                 if config.attention_bias else None,
                 rngs=rng,
                 quant_config=quant_config,
-                prefix=prefix + ".k_proj",
+                prefix=prefix + ".v_proj",
             )
-            self.v_proj = None
-        else:
-            self.qkv_proj = JaxQKVParallelLinear(
-                hidden_size=self.hidden_size,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                rngs=rng,
-                quant_config=quant_config,
-                prefix=prefix,
-            )
-            self.q_proj = None
-            self.k_proj = None
-            self.v_proj = None
 
         self.q_norm = JaxRmsNorm(
             self.head_dim,
@@ -441,13 +426,10 @@ class Gemma4Attention(JaxModule):
         attention_metadata: AttentionMetadata,
     ) -> Tuple[jax.Array, jax.Array]:
         md = attention_metadata
-        if self.qkv_proj is not None:
-            q, k, v = self.qkv_proj(x)
-        else:
-            k = self.k_proj(x)
-            v = k
-            # q: (T, N, H)
-            q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x) if self.v_proj is not None else k
+        # q: (T, N, H)
+        q = self.q_proj(x)
         # Q norm (always applied)
         q = self.q_norm(q)
 
@@ -509,6 +491,7 @@ class Gemma4Attention(JaxModule):
             k_scale=k_scale,
             v_scale=v_scale,
             update_kv_cache=not self.is_kv_shared_layer,
+            decode_query_size=self.decode_query_size,
         )
         # (T, D)
         o = self.o_proj(outputs)
@@ -525,6 +508,7 @@ class Gemma4DecoderLayer(JaxModule):
                  mesh: Mesh,
                  kv_cache_dtype: str,
                  quant_config: VllmQuantConfig,
+                 decode_query_size: int = 1,
                  prefix: str = ""):
         text_config: Gemma4TextConfig = config.hf_config.text_config
         rms_norm_eps = text_config.rms_norm_eps
@@ -561,6 +545,7 @@ class Gemma4DecoderLayer(JaxModule):
                                          mesh=mesh,
                                          kv_cache_dtype=kv_cache_dtype,
                                          quant_config=quant_config,
+                                         decode_query_size=decode_query_size,
                                          prefix=prefix + ".self_attn")
         self.post_attention_layernorm = JaxRmsNorm(
             hidden_size,
@@ -866,6 +851,10 @@ class Gemma4Model(JaxModule):
             self.per_layer_input_scale = 0.0
             self.per_layer_projection_scale = 0.0
 
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        decode_query_size = (spec_config.num_speculative_tokens +
+                             1) if spec_config else 1
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             text_config.num_hidden_layers,
             lambda layer_index: Gemma4DecoderLayer(
@@ -876,6 +865,7 @@ class Gemma4Model(JaxModule):
                 mesh=mesh,
                 kv_cache_dtype=vllm_config.cache_config.cache_dtype,
                 quant_config=vllm_config.quant_config,
+                decode_query_size=decode_query_size,
                 prefix=f"{prefix}.layers.{layer_index}",
             ))
 
@@ -1021,12 +1011,8 @@ class Gemma4Model(JaxModule):
 
 
 class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
+    # qkv_proj packing is removed in PR 3376 for performance gain
     packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
         "gate_up_proj": [
             "gate_proj",
             "up_proj",

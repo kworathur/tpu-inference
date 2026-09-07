@@ -38,7 +38,8 @@ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
-from tpu_inference.layers.common.moe import MoEBackend
+from tpu_inference.layers.common.moe import \
+    FusedMoEMethodBase as TpuFusedMoEMethodBase
 from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_moe_weights, quantize_moe_weights,
     shard_moe_weights)
@@ -90,7 +91,7 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
         return None
 
 
-class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
+class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
 
     def __init__(
         self,
@@ -104,14 +105,16 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         # specific post processing to the weights.
         self.mxfp4_backend = Mxfp4MoeBackend.TRITON
 
+        # vLLM's Mxfp4MoEMethod.__init__ (intentionally skipped above) sets
+        # is_k3_situ_aiter for the ROCm AITER Kimi-K3 path, and inherited
+        # methods such as create_weights read it. That path never applies on
+        # TPU, so pin it to False.
+        self.is_k3_situ_aiter = False
+
         self.mesh = mesh
         self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
 
-        self.extra_backend_kwargs = {}
-        if self.moe_backend == MoEBackend.FUSED_MOE:
-            # When fused moe kernle is used, we pass extra arguments like
-            # tuned block sizes to the kernel.
-            self.extra_backend_kwargs = dict(ep_axis_name=ep_axis_name, )
+        TpuFusedMoEMethodBase.__init__(self, self.moe_backend, ep_axis_name)
 
     def get_fused_moe_quant_config(
             self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:

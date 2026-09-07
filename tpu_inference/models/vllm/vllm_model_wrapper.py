@@ -27,6 +27,7 @@ import torch.nn
 import torchax
 import vllm.envs as vllm_envs
 from flax.typing import PRNGKey
+from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torchax.interop import jax_view, torch_view
 from torchax.ops.mappings import TORCH_DTYPE_TO_JAX, t2j
@@ -46,7 +47,8 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import \
 from tpu_inference import envs
 from tpu_inference.distributed.jax_parallel_state import \
     get_pp_group as jax_get_pp_group
-from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.attention_metadata import (
+    AttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
     shard_model_to_tpu
@@ -54,6 +56,8 @@ from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
 from tpu_inference.logger import init_logger
 from tpu_inference.lora.lora_manager import (TPULRUCacheWorkerLoRAManager,
                                              parse_lora_module_path_env)
+from tpu_inference.models.common.compiler_options import \
+    get_step_fn_compiler_options
 from tpu_inference.models.common.interface import PoolerFunc
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
@@ -71,25 +75,33 @@ from tpu_inference.runner.mm_encoder_jit_manager import (
 logger = init_logger(__name__)
 
 
-def _get_sc_allreduce_allgather_offload_min_size_bytes() -> int:
-    """Returns the SparseCore all-reduce/all-gather offload minimum size in bytes.
+def _to_row_major(arr: jax.Array, key: str) -> jax.Array:
+    """Materializes ``arr`` in row-major layout.
 
-    Returns 0 if we use default XLA offload threshold.
+    XLA:TPU picks the layout of a device array from its shape alone. For a
+    narrow 2-D table -- the rope ``cos_sin_cache`` ([max_position, 64]), the
+    hash-MoE ``hash_indices_table`` ([vocab_size, 6]) -- the minor-most
+    dimension would be padded out to a full 128-lane tile, so XLA prefers the
+    transposed layout {0,1}, which needs no padding. Consumers of the table
+    (the rope kernels and any other custom call, an XLA gather) want the
+    default {1,0}, so the compiler inserts a ``copy(t[N,c]{0,1}) -> t[N,c]{1,0}``
+    of the whole table into the step function -- on every forward pass.
+    Committing the buffer in {1,0} at load time moves that relayout to load
+    time; the buffer then pays the lane padding permanently (2x HBM for a
+    64-wide f32 table, 21x for a 6-wide one).
     """
-    sc_threshold_val = envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES
-    sc_threshold_bytes = 0
-    if sc_threshold_val == "auto":
-        from tpu_inference.tpu_info import get_tpu_vmem_size_bytes
-        sc_threshold_bytes = get_tpu_vmem_size_bytes()
-    else:
-        try:
-            sc_threshold_bytes = int(sc_threshold_val)
-        except ValueError:
-            logger.warning(
-                f"Invalid value for SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: "
-                f"'{sc_threshold_val}'. Defaulting to 0 (always offload).")
-            sc_threshold_bytes = 0
-    return sc_threshold_bytes
+    fmt = getattr(arr, "format", None)
+    if fmt is None or fmt.layout is None:
+        return arr
+    row_major = Layout(tuple(range(arr.ndim)))
+    if fmt.layout.major_to_minor == row_major.major_to_minor:
+        return arr
+    out = jax.device_put(arr, Format(row_major, arr.sharding))
+    logger.info(
+        "Relaid out %s %s from layout %s to %s at load time to avoid a "
+        "per-step XLA layout copy", key, arr.shape, fmt.layout.major_to_minor,
+        row_major.major_to_minor)
+    return out
 
 
 class _VllmRunner(torch.nn.Module):
@@ -276,19 +288,29 @@ class VllmModelWrapper:
         # positions are 1-D and bounded by max_model_len (standard text RoPE);
         # MRoPE video positions are structural and can exceed max_model_len, so
         # skip the slice there to avoid an out-of-bounds cos_sin_cache gather.
-        if envs.SLICE_ROPE_CACHE and \
-                not self.vllm_config.model_config.uses_mrope:
-            max_len = self.vllm_config.model_config.max_model_len
+        slice_rope_cache = envs.SLICE_ROPE_CACHE and \
+            not self.vllm_config.model_config.uses_mrope
+        max_len = self.vllm_config.model_config.max_model_len
+        for key, val in list(params_and_buffers.items()):
+            if not key.endswith("rotary_emb.cos_sin_cache"):
+                continue
+            arr = jax_view(val)
+            if slice_rope_cache and arr.shape[0] > max_len:
+                arr = arr[:max_len]
+                logger.info(
+                    "Sliced rope cache %s rows %d -> %d. Assumes "
+                    "positions are 1-D and bounded by max_model_len "
+                    "(%d); MRoPE (video) can exceed it and is excluded", key,
+                    jax_view(val).shape[0], max_len, max_len)
+            if envs.ROPE_CACHE_ROW_MAJOR:
+                arr = _to_row_major(arr, key)
+            params_and_buffers[key] = torch_view(arr)
+
+        if envs.HASH_TABLE_ROW_MAJOR:
             for key, val in list(params_and_buffers.items()):
-                if key.endswith("rotary_emb.cos_sin_cache"):
-                    arr = jax_view(val)
-                    if arr.shape[0] > max_len:
-                        params_and_buffers[key] = torch_view(arr[:max_len])
-                        logger.info(
-                            "Sliced rope cache %s rows %d -> %d. Assumes "
-                            "positions are 1-D and bounded by max_model_len "
-                            "(%d); MRoPE (video) can exceed it and is excluded",
-                            key, arr.shape[0], max_len, max_len)
+                if key.endswith("hash_indices_table"):
+                    params_and_buffers[key] = torch_view(
+                        _to_row_major(jax_view(val), key))
 
         self._pooler: Pooler | None = self.model.pooler
 
@@ -327,23 +349,6 @@ class VllmModelWrapper:
 
     def jit_step_func(self):
 
-        compiler_options = {
-            "xla_tpu_all_gather_collective_matmul_mode":
-            "post_spmd_conservative",
-            "xla_tpu_reduce_scatter_collective_matmul_mode":
-            "post_spmd_conservative",
-            "xla_tpu_use_minor_sharding_for_major_trivial_input": "true",
-        }
-        sc_offload_bytes = _get_sc_allreduce_allgather_offload_min_size_bytes()
-        if sc_offload_bytes > 0:
-            threshold_bytes = str(sc_offload_bytes)
-            compiler_options[
-                "xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"] = (
-                    threshold_bytes)
-            compiler_options[
-                "xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"] = (
-                    threshold_bytes)
-
         def step_fun_impl(
             params_and_buffers,  # This has been wrapped into torchax TorchValue
             kv_caches: List[jax.Array],
@@ -356,6 +361,7 @@ class VllmModelWrapper:
             intermediate_tensors: JaxIntermediateTensors = None,
             is_first_rank: bool = True,
             is_last_rank: bool = True,
+            shared_attention_metadata: SharedAttentionMetadata | None = None,
             *args,
         ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array]] | Tuple[
                 List[jax.Array], jax.Array, List[jax.Array], jax.Array]:
@@ -374,10 +380,11 @@ class VllmModelWrapper:
                     kv_caches=kv_caches,
                     mesh=self.mesh,
                     layer_name_to_kvcache_index=layer_name_to_kvcache_index,
-                    vllm_config=self.vllm_config), set_forward_context(
-                        attn_metadata=attn_metadata,
-                        vllm_config=self.vllm_config,
-                        num_tokens=num_tokens):
+                    vllm_config=self.vllm_config,
+                    shared_attn_metadata=shared_attention_metadata
+            ), set_forward_context(attn_metadata=attn_metadata,
+                                   vllm_config=self.vllm_config,
+                                   num_tokens=num_tokens):
                 # We need to wrap args from jax land into TorchValue with
                 # torch_view in order to call the Torch function.
                 original_lora_metadata = replace_lora_metadata(
@@ -501,7 +508,7 @@ class VllmModelWrapper:
 
         step_fun_with_options = step_fun_jit(
             step_fun_impl,
-            compiler_options=compiler_options,
+            compiler_options=get_step_fn_compiler_options(),
         )
 
         if self.is_draft_model:
@@ -543,16 +550,17 @@ class VllmModelWrapper:
                 for k, v in kwargs.items()
             }
 
-            output_from_torch = torch.func.functional_call(
-                self.model,
-                torch_view(params_and_buffers),
-                kwargs={
-                    "call_method": "embed_multimodal",
-                    "call_args": (),
-                    "call_kwargs": call_kwargs,
-                },
-                tie_weights=False,
-            )
+            with torchax.default_env():
+                output_from_torch = torch.func.functional_call(
+                    self.model,
+                    torch_view(params_and_buffers),
+                    kwargs={
+                        "call_method": "embed_multimodal",
+                        "call_args": (),
+                        "call_kwargs": call_kwargs,
+                    },
+                    tie_weights=False,
+                )
 
             return jax_view(output_from_torch)
 
