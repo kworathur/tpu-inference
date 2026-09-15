@@ -2,29 +2,71 @@
 
 Issue URL: https://github.com/vllm-project/tpu-inference/issues/3483
 
-## Which models are affected by the bug? 
+## Which models are affected by the bug?
 
-Hybrid Gated DeltaNet models [1], which include both full attention and a variation of the Mamba layers proposed in ; for these models, overestimates are possible[2]. DeepSeek v4 models have layers that are not included in the hybrid KV cache manager's accounting routine; for these models, KV cache size can be underestimated [4]. 
+Hybrid Gated DeltaNet models [1], which include both full attention and a variation of the Mamba layers proposed in; for these models, overestimates are possible [2]. DeepSeek v4 models have layers that are not included in the hybrid KV cache manager's accounting routine; for these models, KV cache size can be underestimated [4].
 
 ## Root cause of the bug:
 
 vLLM's Hybrid KV Cache Manager allocates memory for all layer types from a single pool [5](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/?h=#definitions:~:text=We%20use%20a%20single%20memory%20pool%20for%20all%20layer%20types). **Page size** is defined as the physical size of a block. Each block actually stores block_size * num_layers tokens, which means that page size can vary by attention type. This is problematic, since single pool allocation enforces a uniform page size constraint in vLLM.
 
-vLLM also performs an optimization called **grouping**, where it will allocate memory for a group of identical layers at a time, rather than call the allocator for each layer. The group size should be chosen strategically to reduce the amount of padding in each group. The current heuristic for determining group size can be found on line 262 of `kv_cache_manager.py`. vLLM divides physical memory into group_size buffers, each storing num_groups layers, one from each group. These buffers are also referred to as `KVCacheTensor`s. 
+vLLM also performs an optimization called **grouping**, where it will allocate memory for a group of identical layers at a time, rather than call the allocator for each layer. The group size should be chosen strategically to reduce the amount of padding in each group. The current heuristic for determining group size can be found on line 262 of `kv_cache_manager.py`. vLLM divides physical memory into group_size buffers, each storing num_groups layers, one from each group. These buffers are also referred to as `KVCacheTensor`s.
 
-However, the TPU backend for vLLM does not support storing tensors from different layer types in the same buffer. This is because `jax.Array` (used for allocating buffers) are strongly typed. As a workaround, tpu-inference allocates buffers per layer, rather than per group slice (multiple layers). The number of block IDs that can be used to index a group's blocks outnumbers the number of block IDs used to index a layer's blocks. Intuitively, the amount of memory needed to store a layer's blocks is less than the amount of memory needed to store multiple layer's blocks. 
+However, the TPU backend for vLLM does not support storing tensors from different layer types in the same buffer. This is because `jax.Array` (used for allocating buffers) are strongly typed. As a workaround, tpu-inference allocates buffers per layer, rather than per group slice (multiple layers). The number of block IDs that can be used to index a group's blocks outnumbers the number of block IDs used to index a layer's blocks. Intuitively, the amount of memory needed to store a layer's blocks is less than the amount of memory needed to store multiple layer's blocks.
 
-This discrepancy prompts a workaround in tpu-inference that involves padding the page size of all layers to be 
+This discrepancy prompts a workaround in tpu-inference that involves padding the page size of all layers to be
 
-$$\text{uniform\_page\_size\_bytes} = \text{num\_attention\_groups} * \text{attention\_page\_size} \\ + \text{num\_mamba\_groups} * \text{unpadded\_mamba\_page\_size}$$
+$$\text{uniform\_page\_size\_bytes} = \text{num\_attention\_groups} *\text{attention\_page\_size} \\ + \text{num\_mamba\_groups}* \text{unpadded\_mamba\_page\_size}$$
 
-Later in the code, the page size is divided by block_size * num_hidden to obtain the number of blocks per layer. 
+Later in the code, the page size is divided by block_size * num_hidden to obtain the number of blocks per layer.
+
+
+Tracing exercise
+
+get_kv_cache_spec in class KVCacheManager calls update_mamba_page_size_padded (where the eqn above is applied) then _create_attention_spec for each of the layers in the model. _create_attention_spec returns a KVCacheSpec for each layer. get_kv_cache_spec then returns a dictionary mapping layer names to their KVCacheSpec.
+
+@dataclass(frozen=True)
+class KVCacheSpec:
+    """
+    A base class for specifying the KV cache format of one layer.
+    """
+
+    # number of tokens in a block
+    block_size: int
+    ...
+
+KVCacheSpec also includes page_size_bytes, the size of a block for one layer, and the max memory usage for a layer.
+
+In the vLLM core, we call get_kv_cache_specs to collect these dictionaries over all devices in the mesh 
+
+get_kv_cache_spec in TPU worker drills down to KVCacheManager's get_kv_cache_spec
+TPUWorker
+    TPUModelRunner
+        KVCacheManager
+
+After getting all KV cache specs, the TPUWorker is initialized from a KVCacheConfig that includes the number of blocks:
+
+@dataclass
+class KVCacheConfig:
+    """
+    The KV cache configuration of a model.
+    """
+
+    num_blocks: int
+    """The number of KV cache blocks"""
+
+In between get_kv_cache_specs and initialize_form_config, we compute the number of blocks for the KV cache. Where does this happen? In get_kv_cache_configs, line 319 of core. In line 2635 of get_kv_cache_configs, we call _check_enough_kv_cache_memory once per worker. 
+
+
+
+
+
+
 
 
 
 
 However, this padding has unintended effects. When vLLM accounts for the KV cache size of a model, it sums the page size (which is already padded to account for the full KV cache size), and then sums the max memory usage of each layer, producing a vast overestimate of the true KV cache size.
-
 
 ## References
 
@@ -36,9 +78,7 @@ However, this padding has unintended effects. When vLLM accounts for the KV cach
 
 [4] The part of the code where deepseek layers are omitted from cache size calculation is line 64 of `tpu_inference/runner/kv_cache_manager.py`
 
-
 ## Code Tracing Experiment
-
 
 ## Understanding get_kv_cache_shape_with_mesh
 
