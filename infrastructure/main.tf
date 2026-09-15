@@ -49,7 +49,6 @@ resource "google_tpu_v2_vm" "tpu" {
 
   data_disks {
     source_disk = google_compute_disk.disk.id
-    mode        = "READ_ONLY"
   }
  
   labels = {
