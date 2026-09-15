@@ -1,0 +1,108 @@
+# Issue Review: KV Cache Size Accounting Bugs
+
+Issue URL: https://github.com/vllm-project/tpu-inference/issues/3483
+
+## Which models are affected by the bug? 
+
+Hybrid Gated DeltaNet models [1], which include both full attention and a variation of the Mamba layers proposed in ; for these models, overestimates are possible[2]. DeepSeek v4 models have layers that are not included in the hybrid KV cache manager's accounting routine; for these models, KV cache size can be underestimated [4]. 
+
+## Root cause of the bug:
+
+vLLM's Hybrid KV Cache Manager allocates memory for all layer types from a single pool [5](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/?h=#definitions:~:text=We%20use%20a%20single%20memory%20pool%20for%20all%20layer%20types). **Page size** is defined as the physical size of a block. Each block actually stores block_size * num_layers tokens, which means that page size can vary by attention type. This is problematic, since single pool allocation enforces a uniform page size constraint in vLLM.
+
+vLLM also performs an optimization called **grouping**, where it will allocate memory for a group of identical layers at a time, rather than call the allocator for each layer. The group size should be chosen strategically to reduce the amount of padding in each group. The current heuristic for determining group size can be found on line 262 of `kv_cache_manager.py`. vLLM divides physical memory into group_size buffers, each storing num_groups layers, one from each group. These buffers are also referred to as `KVCacheTensor`s. 
+
+However, the TPU backend for vLLM does not support storing tensors from different layer types in the same buffer. This is because `jax.Array` (used for allocating buffers) are strongly typed. As a workaround, tpu-inference allocates buffers per layer, rather than per group slice (multiple layers). The number of block IDs that can be used to index a group's blocks outnumbers the number of block IDs used to index a layer's blocks. Intuitively, the amount of memory needed to store a layer's blocks is less than the amount of memory needed to store multiple layer's blocks. 
+
+This discrepancy prompts a workaround in tpu-inference that involves padding the page size of all layers to be 
+
+$$\text{uniform\_page\_size\_bytes} = \text{num\_attention\_groups} * \text{attention\_page\_size} \\ + \text{num\_mamba\_groups} * \text{unpadded\_mamba\_page\_size}$$
+
+Later in the code, the page size is divided by block_size * num_hidden to obtain the number of blocks per layer. 
+
+
+
+
+However, this padding has unintended effects. When vLLM accounts for the KV cache size of a model, it sums the page size (which is already padded to account for the full KV cache size), and then sums the max memory usage of each layer, producing a vast overestimate of the true KV cache size.
+
+
+## References
+
+[1] [Gated Delta Networks: Improving Mamba2 with Delta Rule](https://arxiv.org/abs/2412.06464)
+
+[2] [Mamba: Linear-Time Sequence Modeling with Selective State Spaces](https://arxiv.org/abs/2312.00752)
+
+[3] [Hybrid KV Cache Manager in vLLM](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/?h=)
+
+[4] The part of the code where deepseek layers are omitted from cache size calculation is line 64 of `tpu_inference/runner/kv_cache_manager.py`
+
+
+## Code Tracing Experiment
+
+
+## Understanding get_kv_cache_shape_with_mesh
+
+get_kv_cache_shape_with_mesh
+
+line-by-line plain english description:
+
+(1) call get_mesh_shape_product with the mesh and the named axes ('model', 'expert') to get the number of devices to shard attention heads over.
+
+(2) call get_mesh_shape_product with the mesh and the named axes ('dcp', 'pcp'). dcp and pcp refer to decode context parallelism and prefill context parallelism respectively. The return value is the number of DCP processes times the number of PCP processes but only one will be > 1 in practice.
+
+We determine the physical block size by scaling the block size by the result of step (2). This allows us to allocate memory for the KV cache that will be sharded across the PCP or DCP devices. That means that every device receives a different part of the same logical KV cache block.
+
+MLA branch is out of scope for this change, so we will focus on explaining the MHA/GQA branch. In this branch, we compute the KV cache shape using RPA implementation of get_kv_cache_shape. This gives us the size of the KV cache, padded to 32 bit words,
+
+Finally we return a 5-tuple representing the shape of the KV cache to be allocated in GPU memory.
+
+Mamba = alternative to attention layer in LLM that uses state space search
+
+## Plain english description of update_mamba_page_size_padded
+
+A KV cache group in vLLM spans multiple layers. In the comments, "type" refers to type of layer in an LLM. Group sizing math in `update_mamba_page_size_padded` works as follows:
+
+if the greater of {num_attn, num_mamba} is within factor of 1.5 of the smllaer of {num_attn, num_mamba} then set group_size to be the greater of {num_attn, num_mamba}.
+Effect: group size is 1 for every type
+
+Otherwise, set group_size to smaller of {num_attn, num_mamba}.
+Effect: no padding, but the larger of the two might have multiple groups.
+
+## Simple Explanation of the Bug
+
+vLLM counts the number of bytes needed to store the KV cache in order to allocate sufficient GPU memory for it. While the KV cache is organized in physical memory in units of blocks, vLLM uses pages (which store bytes for one block of one layer) to perform KV cache accounting.
+
+Currently, vLLM assumes a common page size across all attention layers; this assumption breaks for hybrid architectures, such as ones that use full attention + GDN layers like in the bug report. To compute the uniform page size for these architectures, vLLM uses a heuristic that presently looks at two types of layers: full attention layers and mamba layers.
+
+This heuristic sets the group size to be max(num_attn, num_mamba) when the two counts are sufficiently close. This group size then determines the page size in line 269 of update_mamba_page_size_padded. In this way, the page size ends up being determined by the layer geometry that appears more in the LLM's architecture.
+
+There are two seperate mis-estimates that can arise as a result of this oversimplified accounting.
+
+1) The KV cache resource manager looks at the max page size when determining if sufficient GPU memory exists, leading to an overestimate of the true KV cache size.
+2) Layers that don't fall in the {full attention, mamba} set assume the same page size as all other layers, which can be estimate.
+
+The mechanism to opt-out could make estimates accurate even as new layers are added, as the current opt-out only whitelists four DeepSeek v4 and mamba layers.
+
+Why groups should be used to compute page_size instead of the model layers. A group is homogenous in that it stores KV caches of a certain type. A hybrid model can have different types of layers, on the other hand.
+
+The uniform_page_size_bytes formula from update_mamba_page_size_padded:
+
+uniform_page_size_bytes = (num_attn_groups *attn_page_size_bytes +
+                                   num_mamba_groups* unpadded_mamba_page_size)
+
+In Qwen, there are 10 attention layers and 30 mamba layers. So num_attn_groups = 1 and num_mamba_groups = 3
+
+One block of one layer has a number of bytes given by the formula above. But notice that the formula above
+sums page sizes for both kinds of layers.
+
+Q: Why does TPU want a padded page size at all?
+
+A: Each mixed tensor stores layers from different groups (4 shared layers per mixed tensor in Qwen). While the layers in a mixed tensor share the same physical tensor, they can be individually indexed using each layer's block_table. However, layers of different types cannot be overlaid on the same bytes in TPUs, so the TPU actually allocates a physical array per-layer. Project maintainers have mentioned this should be changed in the future (see jacobplatin comment on line 788 of).
+
+In the current setup, the number of slots per layer is outnumbered by block IDs 4 to 1 (for Qwen). The solution is to pad the page size for each layer to be the same size as a single mixed tensor. This is said to correct num_blocks to match the actual physical tensor size allocated by the TPU but I'm still not sure about this.
+
+This page size padding happens inside get_kv_cache_spec, and later the num_blocks get set in initialize_kv_cache
+
+vllm expects page sizes to be unified? Does one page size per KV-cache group break this precondition?
+
+also jacobplatin suggests: "we should not be replicating the kv cache for each layer" (tpu_inference/runner/kv_cache_manager.py, line 788)
