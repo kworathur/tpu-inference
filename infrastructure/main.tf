@@ -1,7 +1,7 @@
 provider "google-beta" {
-  project     = "propane-facet-351921"
-  region      = "us-central1"
-  zone = "us-central1-c"
+  project = "propane-facet-351921"
+  region  = "${var.region}"
+  zone    = "${var.zone}"   # v5e is available here; us-central1-c only supports v2-8 / TPU7x
 }
 
 data "google_tpu_v2_runtime_versions" "available" {
@@ -15,29 +15,25 @@ data "google_tpu_v2_accelerator_types" "available" {
 resource "google_tpu_v2_vm" "tpu" {
   provider = google-beta
 
-  name = "keshav-tpu"
+  name        = "keshav-tpu"
   description = "Test TPU for vLLM experiments."
 
-  runtime_version  = "v2-alpha-tpuv6e" 
+  runtime_version = "v2-alpha-tpuv5-lite"   # v5e runtime
 
   accelerator_config {
-    type     = "V6E"
-    topology = "1x1"
+    type     = "V5LITE_POD"   # v5e
+    topology = "1x1"         # single chip
   }
 
-  cidr_block = "10.0.0.0/29"
+  scheduling_config {
+    reserved = false
+  }
 
   network_config {
     can_ip_forward      = true
     enable_external_ips = true
     network             = google_compute_network.network.id
     subnetwork          = google_compute_subnetwork.subnet.id
-    queue_count         = 32
-  }
-
-  scheduling_config {
-    preemptible = true
-    spot = true
   }
 
   shielded_instance_config {
@@ -55,7 +51,7 @@ resource "google_tpu_v2_vm" "tpu" {
     source_disk = google_compute_disk.disk.id
     mode        = "READ_ONLY"
   }
-
+ 
   labels = {
     foo = "bar"
   }
@@ -74,7 +70,7 @@ resource "google_compute_subnetwork" "subnet" {
 
   name          = "tpu-subnet"
   ip_cidr_range = "10.0.0.0/16"
-  region        = "us-central1"
+  region        = "${var.region}"
   network       = google_compute_network.network.id
 }
 
@@ -96,10 +92,10 @@ resource "google_compute_disk" "disk" {
   provider = google-beta
 
   name  = "tpu-disk"
-  image = "debian-cloud/debian-11"
+  image = "debian-cloud/debian-12"
   size  = 10
-  type  = "pd-ssd"
-  zone  = "us-central1-c"
+  type  = "pd-balanced"
+  zone  = "${var.zone}"   # matches TPU zone
 }
 
 # Wait after service account creation to limit eventual consistency errors.
