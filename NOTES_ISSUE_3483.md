@@ -8,7 +8,7 @@ Hybrid Gated DeltaNet models [1], which include both full attention and a variat
 
 ## Root cause of the bug:
 
-vLLM's Hybrid KV Cache Manager allocates memory for all layer types from a single pool [5]. Memory is allocated in units of pages; **page size** is defined as the physical size of a block. Each block stores `block_size` tokens, each consuming `kv_hidden` bytes. Page size is then `block_size` * `kv_hidden`  * `num_layers`, which means that page size can vary by attention type. But allocating pages from a single pool means we must use a uniform page size across all layers.
+vLLM's Hybrid KV Cache Manager allocates memory for all layer types from a single pool [5]. Memory is allocated in units of pages; **page size** is defined as the physical size of a block. Each block stores `block_size` tokens, each consuming `kv_hidden` bytes. Page size is then `block_size` *`kv_hidden`* `num_layers`, which means that page size can vary by attention type. But allocating pages from a single pool means we must use a uniform page size across all layers.
 
 **KV cache groups** are the solution to this problem. vLLM will allocate memory for a group of `group_size` identical layers at a time, rather than call the allocator for each layer. All groups have the same number of layers, so the page size remains uniform across groups. Note that the `num_blocks` per layer (and by extension group) can and should vary in the case of hybrid models. The value of `group_size` should be chosen strategically to reduce the amount of padding in each group [6]. vLLM then divides physical memory into `group_size` buffers, each storing `num_groups` layers, one from each group (group slice). The buffers are also referred to as `KVCacheTensor`s.
 
@@ -18,65 +18,41 @@ This discrepancy prompts a workaround in tpu-inference (see `update_mamba_page_s
 
 $$\text{uniform\_page\_size\_bytes} = \text{num\_attention\_groups} *\text{attention\_page\_size} \\ + \text{num\_mamba\_groups}* \text{unpadded\_mamba\_page\_size}$$
 
-which is exactly the size of one `KVCacheTensor` and satisfies the uniform page size constraint from before. 
+which is exactly the size of one `KVCacheTensor` and satisfies the uniform page size constraint from before.
 
-In the vLLM core, we call `get_kv_cache_specs()` which calls `get_kv_cache_spec()` on each worker to obtain layer name -> `KVCacheSpec` mappings. Each `KVCacheSpec` stores the padded `page_size_bytes` set in `update_mamba_page_size_padded()`. 
+In the vLLM core, we call `get_kv_cache_specs()` which calls `get_kv_cache_spec()` on each worker to obtain layer name -> `KVCacheSpec` mappings. Each `KVCacheSpec` stores the padded `page_size_bytes` set in `update_mamba_page_size_padded()`.
 
 Next, we call `get_kv_cache_configs()`, which handles the following:
 
 1) merges KV cache specs across workers into a global layer name -> `KVCacheSpec` mapping.
-2) grouping layers in the model that have the same `KVCacheSpec` to create a list of `KVCacheGroupSpec`s 
+2) grouping layers in the model that have the same `KVCacheSpec` to create a list of `KVCacheGroupSpec`s
 
-In the failing run with Qwen, the hybrid KV cache manager was enabled. Under this setting, vLLM unifies the kv cache spec page size, which appears to be a no-op since the `page_size_bytes` has already been standardized by `update_mamba_page_size_padded` and `_create_attention_spec`. If the `page_size_bytes` were not standardized, vLLM will pad the Mamba page size to the largest page size. Unlike full attention layers, Mamba page size does not scale with block_size.
+In the failing run with Qwen, the hybrid KV cache manager was enabled. Under this setting, vLLM unifies the KVCacheSpec page size, which appears to be a no-op since the `page_size_bytes` has already been standardized by `update_mamba_page_size_padded` and `_create_attention_spec`. If the `page_size_bytes` were not standardized, vLLM will pad the Mamba page size to the largest page size. Unlike full attention layers, Mamba page size does not scale with block_size.
 
 After ensuring a uniform page size across all specs, vLLM gets the KV cache groups using the exact same heuristic as in tpu-inference to obtain a list of `KVCacheGroupSpec`s, one for each cache group (see `_get_kv_cache_groups_uniform_page_size()` line 1516).
 
 3) assigning all or some of a KV cache groups layers to each worker (projection) and then checking there is enough memory on each worker to store its part of the KV cache
 
-The layer->KVCacheSpec mapping for each worker is passed as a list argument to get_kv_cache_configs. The failing run in the issue only used tensor parallelism but not pipeline parallelism. This means each worker should receive part of each of the model's layers since tensor parallelism splits the model width-wise. 
+Projection: the layer->KVCacheSpec mapping for each worker is passed as a list argument to `get_kv_cache_configs()`. `KVCacheGroupSpecs` are assigned to workers depending on whether tensor and/or pipeline parallelism is enabled. Since the failing run only had tensor parallelism enabled, each worker should receive every `KVCacheGroupSpec` and store part of the KV cache for each layer. 
 
+Memory checks: The available memory in bytes for each worker is defined in the `available_memory` array and optionally can be overridden by `num_gpu_blocks_override`. In the absence of an override, vLLM  subtracts the sum of all `page_size_bytes` over layers in a group from each worker's available memory[7]. This sum is exactly the size of the *entire* KV cache, which seems like a mistake considering that no worker is storing the entire KV cache in this tensor parallel mode of execution.
 
-4) checking that there is enough memory on each worker to store its part of the KV cache
+After this initial accounting for used memory, vLLM does another pass over all workers, calling `_check_enough_kv_cache_memory()` with `_max_memory_usage_bytes_from_groups()` as the function for computing needed memory.  First it computes the same sum of `page_size_bytes` over all layers in a KV cache group, and stores it as `bytes_per_block`. Then it divides a group spec's `max_memory_usage_bytes` by its `page_size_bytes` to get the number of blocks for the group. Finally it returns `bytes_per_block` * `num_blocks`. Although Mamba's `max_memory_usage_bytes` should not scale with `max_model_len` according to the issue poster, the implementation on line 22 of MambaSpec seems to suggest otherwise:
 
-This step is where the error in this issue comes from. One of the arguments to get_kv_cache_configs is an array `available_memory`, containing the number of bytes available per worker. 
+```python
+max_model_len = vllm_config.model_config.max_model_len
+            return (
+                cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
+            ) * self.page_size_bytes
+```
 
-If no num_gpu_blocks_override is set:
+So the needed memory for the worker is clearly an overestimate, and since we already subtracted the full KV cache size from each worker's available memory, there is simply not enough memory to allocate and vLLM returns the following error:
 
-From each worker's available memory, we subtract the max sum of `page_size_bytes` of each layer in a group over all groups. Note in our case, all groups have the same `page_size_bytes` (due to padding) so the max is just the sum of `page_size_bytes` for any of the groups. Take for example, a model with 10 full attn + 30 mamba, group_size is 10 and there are four groups. Each page_size_padded sums bytes of one layer from each four groups. Add 10 `page_size_padded` to get the actual number of bytes consumed by the KV cache. 
+> ​ ValueError: To serve at least one request with the model's max seq len (65536), (596.12 GiB KV cache is needed, which is larger than the available KV cache memory (54.55 GiB). Based on the available memory, the estimated maximum model length is 5904.
 
-Up to this point, the code seems to be working properly. 
+The rest of `get_kv_cache_configs()` is not run, but this is what would happen if the error weren't raised: 
 
-
-
-
-
-
-If there is no num_gpu_blocks_override set, we subtract _pool_bytes_per_block(groups) bytes from each worker. 
-
-
-To check if there is enough memory, vLLM first initializes an array available_memory , 
-
-check_memory = [
-        avail_mem - _pool_bytes_per_block(groups) if groups else avail_mem
-        for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
-    ]
-
-
-
-
-
-
-When does the total number of blocks differ from the number of allocated blocks in get_kv_cache_configs()?
-
-_max_memory_usage_bytes_from_groups computes a total num_blocks that is different than `_get_kv_cache_bytes_per_block()`
-5) 
-grouping per-layer KV cache specs and ensuring they all have the same page size
-
-
-
- in which we call `get_kv_cache_config_from_groups()`. This function is responsible for computing `num_blocks`. To compute `num_blocks`, the function `get_kv_cache_config_from_groups()` first calls `_get_kv_cache_bytes_per_block()`
-
-`_get_kv_cache_bytes_per_block()` then  Sanity check: physical block in memory stores page_size_bytes from each of the layers in a group, which matches the [equation](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/#definitions:~:text=page%20size%3A%20the%20physical%20memory%20size%20of%20a%20block%2C%20defined%20as%3A) in the vLLM docs.
+From each worker's available memory, we subtract the max sum of `page_size_bytes` of each layer in a group over all groups. Note in our case, all groups have the same `page_size_bytes` (due to padding) so the max is just the sum of `page_size_bytes` for any of the groups. Take for example, a model with 10 full attn + 30 mamba, group_size is 10 and there are four groups. Each page_size_padded sums bytes of one layer from each four groups. Add 10 `page_size_padded` to get the actual number of bytes consumed by the KV cache.
 
 Finally, we compute  the number of blocks allocated to the KV cache using the lines below
 
@@ -85,11 +61,7 @@ num_blocks = available_memory // bytes_per_block
 num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 ```
 
-Once we have determined the number of blocks, 
-
-The error in the original issue comes from the _check_enough_kv_cache_memory function, 
-
-Finally, we call initialize_from_config in the engine core
+Once we have determined the number of blocks, we can create the `KVCacheConfig`s and call `initialize_from_config()` in the engine core.
 
 After getting all KV cache configs, the TPUWorker is initialized from a `KVCacheConfig` that includes the number of blocks:
 
@@ -104,46 +76,7 @@ class KVCacheConfig:
     """The number of KV cache blocks"""
 ```
 
-Read test_get_kv_cache_spec_hybrid_mamba_cache_config_updates in its entirety before dumping variables on a TPU.
-
-
-`get_kv_cache_spec()` in class KVCacheManager calls `update_mamba_page_size_padded()` (where the eqn above is applied) then `_create_attention_spec()` for each of the layers in the model. `_create_attention_spec()` returns a `KVCacheSpec` for each layer. `get_kv_cache_spec()` then returns a dictionary mapping layer names to their KVCacheSpec.
-
-
-get_kv_cache_spec in a TPU worker drills down to KVCacheManager's get_kv_cache_spec
-TPUWorker
-    TPUModelRunner
-        KVCacheManager
-
-```python
-@dataclass(frozen=True)
-class KVCacheSpec:
-    """
-    A base class for specifying the KV cache format of one layer.
-    """
-
-    # number of tokens in a block
-    block_size: int
-    ...
-    page_size_bytes: int # where the padded page size is stored
-    max_memory_usage_bytes: int
-```
-
-KVCacheSpec also includes `page_size_bytes`, the size of a block for one layer. The `max_memory_usage_bytes` for a layer. 
-
-
-
-
-Extra detail 
-
- All layers in a group can share the same block table, but the same logical block ID will resolve to different physical block IDs for each layer.
-
-
-
-
-
-
-However, this padding has unintended effects. When vLLM accounts for the KV cache size of a model, it sums the page size (which is already padded to account for the full KV cache size), and then sums the max memory usage of each layer, producing a vast overestimate of the true KV cache size.
+TODO: Read test_get_kv_cache_spec_hybrid_mamba_cache_config_updates
 
 ## References
 
@@ -158,6 +91,10 @@ However, this padding has unintended effects. When vLLM accounts for the KV cach
 [5] [Single memory pool allocation](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/?h=#definitions:~:text=We%20use%20a%20single%20memory%20pool%20for%20all%20layer%20types)
 
 [6] The current heuristic for determining group size can be found on line 262 of `kv_cache_manager.py`.
+
+[7] (technically the group with max sum is selected, but in this case they're all the same)
+
+
 
 ## Code Tracing Experiment
 
