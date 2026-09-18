@@ -10,7 +10,7 @@ Hybrid Gated DeltaNet models [1], which include both full attention and a variat
 
 vLLM's Hybrid KV Cache Manager allocates memory for all layer types from a single pool [5]. Memory is allocated in units of pages, each measuring a physical block in memory; the physical block size is determined by `block_size` * `kv_hidden`, multiplied by a number of layers (all the same type, not necessarily all model layers). Thus, we can end up with different page sizes per attention type, which is not allowed since we allocate pages from a single pool.
 
-**KV cache groups** are the solution to this problem. A group is a collection of identical layers, and the number of layers per group (`group_size`) is uniform across all groups (after padding). The value of `group_size` should be chosen strategically to reduce the amount of padding in each group [6]. Observe that if we standardize `page_size_bytes` (size of a single layer's block), then we can achieve the same physical page size across groups. Every attention type has its own `page_size_bytes`, requiring a trick to make this value consistent across attention types. 
+**KV cache groups** are the solution to this problem. A group is a collection of identical layers, and the number of layers per group (`group_size`) is uniform across all groups (after padding). The value of `group_size` should be chosen strategically to reduce the amount of padding in each group [6]. Observe that with the `group_size` fixed, if we manage to standardize `page_size_bytes` (size of a single layer's block), then we can achieve the same physical page size across groups. Every attention type has its own `page_size_bytes`, requiring a trick to make this value consistent across attention types. 
 
 vLLM allocates a single buffer to store KV cache state of multiple groups. Within this buffer, a physical block stores a page from each layer in a group. By using a layer's position for strided access within a block, all layers in a group can share the same logical block IDs. Different groups cannot share the same logical block IDs, however, since that would result in groups overwriting each other's data in the shared buffer. Notably, if groups have different dtypes for their data, vLLM on GPU can return a view for part of the buffer to the requested dtype, known as **overlaying**.
 
@@ -20,9 +20,9 @@ $$\text{uniform\_page\_size\_bytes} = \text{num\_attention\_groups} *\text{atten
 
 This trick achieves a uniform page size while sizing the number of block IDs (block pool size) to fit in the bounds of the per-layer buffers. For example, in the unit test for the padding formula above [9], we have a model with a 1:1 ratio of full attention to Mamba layers. The unpadded mamba page size is $3 * 12288 * 2 + 64 * 128 * 128 * 4$ bytes, which is product of dimensions in convolutional state times number of bytes to store a bf16 data type, plus the product of dimensions in the recurrent state times number of bytes to store a float32 data type. The attention page size is $1081344$ bytes. We pad every layer's page size to be `attention_page_size` + `unpadded_mamba_page_size`
 
-When vLLM computes the total number of blocks to allocate for a KV cache group, it will divide its `max_memory_usage_bytes` (computed by vLLM), by this padded page size. This padded page size works by giving the illusion that a page holds multiple pages, one from each KV cache group. 
+When vLLM computes the total number of blocks to allocate for all KV cache groups, it will divide its `available_memory` (computed by vLLM), by this `padded_page_size`. This padded page size works by presenting a "page" as a collection of one page from each layer, so the group dimension disappears and we are just left with the number of blocks needed for a layer type. 
 
-In the vLLM core, we call `get_kv_cache_specs()` which calls `get_kv_cache_spec()` on each worker to obtain layer name -> `KVCacheSpec` mappings. Each `KVCacheSpec` stores the padded `page_size_bytes` set in `update_mamba_page_size_padded()`.
+The logic that actually produces the estimate is in the engine core of vLLM. We call `get_kv_cache_specs()` which calls `get_kv_cache_spec()` on each worker to obtain layer name -> `KVCacheSpec` mappings. Each `KVCacheSpec` stores the padded `page_size_bytes` set in `update_mamba_page_size_padded()`.
 
 Next, we call `get_kv_cache_configs()`, which handles the following:
 
@@ -39,13 +39,15 @@ Projection: the layer->KVCacheSpec mapping for each worker is passed as a list a
 
 Memory checks: The available memory in bytes for each worker is defined in the `available_memory` array and optionally can be overridden by `num_gpu_blocks_override`. In the absence of an override, vLLM  subtracts the size of a null block from each worker's available memory [7]. The size of this null block is the sum of `page_size_bytes` over layers in a group, which lines up with our intuition that `page_size_bytes` measures the size of one layer's block.
 
-After this initial accounting for null blocks, vLLM does another pass over all workers, calling `_check_enough_kv_cache_memory()` with `_max_memory_usage_bytes_from_groups()` as the function for computing needed memory.  First it computes the same sum of `page_size_bytes` over all layers in a KV cache group, and stores it as `bytes_per_block`. Then the function divides a group spec's `max_memory_usage_bytes` by its `page_size_bytes` to get the number of blocks for the group. Finally it returns `bytes_per_block` * `num_blocks` as the amount of memory needed to store the KV cache. 
+After this initial accounting for null blocks, vLLM does another pass over all workers, calling `_check_enough_kv_cache_memory()` with `_max_memory_usage_bytes_from_groups()` as the function for computing needed memory. This estimates memory usage in a setting where a sequence of max_sequence_len is provided in a request. First the function computes the sum of `page_size_bytes` over all layers in a KV cache group, and stores it as `bytes_per_block`. Then the function divides a group spec's `max_memory_usage_bytes` by its `page_size_bytes` to get the number of blocks for the group. 
+
+The function sums `num_blocks` over all groups and returns `bytes_per_block` * `num_blocks` as the amount of memory needed to store the KV cache. The `num_blocks` number is correct - it's the `bytes_per_block` that is the problem. For each block needed to store a full attention's KV cache, we are also billing for Mamba state storage, which has been lumped into `bytes_per_block`. However, Mamba state is O(1) with sequence length. 
 
 Each attention spec implements their own `max_memory_usage_bytes`; for `MambaSpec`, this is a constant value unless the mamba_cache_mode is "all", which TPU does not support. But Mamba bytes (included in block_size_bytes) are over-billed when we multiply them by sequence length, since mamba state should be constant w.r.t to sequence length.
 
 So the needed memory for the worker is an overestimate and vastly exceeds the amount of available device memory. So vLLM returns the following error:
 
-> ​ ValueError: To serve at least one request with the model's max seq len (65536), (596.12 GiB KV cache is needed, which is larger than the available KV cache memory (54.55 GiB). Based on the available memory, the estimated maximum model length is 5904.
+> ​ ValueError: To serve at least one request with the model's max seq len (65536), (596.12 GiB KV cache is needed, which is larger than the available KV cache memory (54.55 GiB). Based on the available memory, the estimated maximum model length is 5904.)
 
 Once we have determined the number of blocks, we can create the `KVCacheConfig`s and call `initialize_from_config()` in the engine core.
 
