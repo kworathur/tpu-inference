@@ -85,3 +85,8 @@ TODO: Read test_get_kv_cache_spec_hybrid_mamba_cache_config_updates
 [8] See `update_mamba_page_size_padded()` for the formula.
 
 [9] Relevant unit test is `test_get_kv_cache_spec_hybrid_mamba_cache_config_updates`
+
+Places where num_gpu_blocks_override is read before determine_available_memory() runs.
+
+1. R on line 1116 of kv_cache_utils.py <- glm5 reads num_gpu_blocks_voerride 
+2. Line 2704 of kv_cache_utils.py
