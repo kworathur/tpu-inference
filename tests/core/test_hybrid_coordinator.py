@@ -14,7 +14,8 @@ from vllm.v1.request import Request, RequestStatus
 from tpu_inference.core.hybrid_coordinator import (
     MambaBlockPool, MirrorMambaBlockPool, TPUDualBlockPool,
     TPUHybridKVCacheCoordinator, TPUKVCacheManager,
-    install_hybrid_coordinator_hooks, set_mamba_num_blocks)
+    install_hybrid_coordinator_hooks, propagate_attn_num_blocks,
+    set_mamba_num_blocks)
 
 
 def _make_mock_hybrid_kv_cache_config(
@@ -616,34 +617,6 @@ class TestHybridCoordinatorHooks:
             propagate_mamba_num_blocks(engine_core, cfg, vllm_config)
         assert hc_mod.get_mamba_num_blocks() is None
 
-    def test_propagate_attn_num_blocks_publishes_worker_value(self):
-        from tpu_inference.core.hybrid_coordinator import \
-            propagate_attn_num_blocks
-
-        # All workers return None => no-op
-        vllm_config = _make_mock_vllm_config(dp_size=2, max_num_seqs=8)
-        vllm_config.cache_config.num_gpu_blocks_override = None
-        engine_core = MagicMock()
-        engine_core.collective_rpc.return_value = [2048, 2048]
-
-        assert propagate_attn_num_blocks(engine_core, vllm_config) == 2048
-        engine_core.collective_rpc.assert_called_once_with(
-            "get_attn_num_blocks")
-        assert vllm_config.cache_config.num_gpu_blocks_override == 2048
-
-        # Workers disagree => raise ValueError
-        engine_core.collective_rpc.return_value = [1024, 2048]
-        with pytest.raises(ValueError, match="disagree"):
-            propagate_attn_num_blocks(engine_core, vllm_config)
-
-        # User-provided override is not lost after propagation
-        vllm_config.cache_config.num_gpu_blocks_override = 1024
-        engine_core.collective_rpc.return_value = [2048, 2048]
-        assert propagate_attn_num_blocks(engine_core, vllm_config)
-        engine_core.collective_rpc.assert_called_once_with(
-            "get_attn_num_blocks")
-        assert vllm_config.cache_config.num_gpu_blocks == 1024  # pre-existing config not overridden
-
     def test_executor_mixin_publishes_after_workers_allocate(self):
         import tpu_inference.core.hybrid_coordinator as hc_mod
         from tpu_inference.core.hybrid_coordinator import \
@@ -678,16 +651,64 @@ class TestHybridCoordinatorHooks:
         assert vllm_config.cache_config.mamba_num_blocks == 640
         assert hc_mod.get_mamba_num_blocks() == 640
 
-    def test_executor_mixin_publishes_attn_before_workers_allocate(self):
-        """
-        Workers call determine_available_memory (reads published num_gpu_blocks_override)
-        before initialize_from_config (allocates device memory)
-        """
-        # TODO: do we need to test with different dp_size
+    def test_propagate_attn_num_blocks_publishes_consensus(self):
+        vllm_config = _make_mock_vllm_config(dp_size=2, max_num_seqs=8)
+        vllm_config.cache_config.num_gpu_blocks_override = None
+        engine_core = MagicMock()
+        engine_core.collective_rpc.return_value = [2048, 2048]
+
+        assert propagate_attn_num_blocks(engine_core, vllm_config) == 2048
+        engine_core.collective_rpc.assert_called_once_with(
+            "get_attn_num_blocks")
+        assert vllm_config.cache_config.num_gpu_blocks_override == 2048
+
+    def test_propagate_attn_num_blocks_rejects_disagreement(self):
+        vllm_config = _make_mock_vllm_config(dp_size=2, max_num_seqs=8)
+        vllm_config.cache_config.num_gpu_blocks_override = None
+        engine_core = MagicMock()
+        engine_core.collective_rpc.return_value = [1024, 2048]
+        with pytest.raises(ValueError, match="disagree"):
+            propagate_attn_num_blocks(engine_core, vllm_config)
+
+        engine_core.collective_rpc.assert_called_once_with(
+            "get_attn_num_blocks")
+        assert vllm_config.cache_config.num_gpu_blocks_override is None
+
+    def test_propagate_attn_num_blocks_skips_user_override(self):
+        user_override_blocks = 1024
+        vllm_config = _make_mock_vllm_config(dp_size=1, max_num_seqs=8)
+        vllm_config.cache_config.num_gpu_blocks_override = user_override_blocks
+        engine_core = MagicMock()
+
+        assert propagate_attn_num_blocks(engine_core, vllm_config) is None
+        engine_core.collective_rpc.assert_not_called()
+        assert vllm_config.cache_config.num_gpu_blocks_override == user_override_blocks
+
+    def test_propagate_attn_num_blocks_noops_when_workers_report_none(self):
+        vllm_config = _make_mock_vllm_config(dp_size=2, max_num_seqs=8)
+        vllm_config.cache_config.num_gpu_blocks_override = None
+
+        rpc_owner = MagicMock()
+        rpc_owner.collective_rpc.return_value = [None, None]
+
+        result = propagate_attn_num_blocks(rpc_owner, vllm_config)
+
+        assert result is None
+        rpc_owner.collective_rpc.assert_called_once_with("get_attn_num_blocks")
+        assert vllm_config.cache_config.num_gpu_blocks_override is None
+
+    def test_executor_mixin_publishes_attn_blocks_after_memory_profile(self):
+        """Publish the planned attention block count after memory profiling and
+        before worker cache allocation."""
         from tpu_inference.core.hybrid_coordinator import \
             MambaPoolSyncExecutorMixin
         calls = []
-        vllm_config = _make_mock_vllm_config(dp_size=1, max_num_seqs=8)
+        attn_num_blocks = 2048
+        available_memory_bytes = 54 * 2**30
+        available_memory = [available_memory_bytes, available_memory_bytes]
+
+        vllm_config = _make_mock_vllm_config(dp_size=2, max_num_seqs=8)
+        vllm_config.cache_config.num_gpu_blocks_override = None
 
         class FakeBaseExecutor:
 
@@ -696,7 +717,7 @@ class TestHybridCoordinatorHooks:
 
             def determine_available_memory(self):
                 calls.append("profiled_memory")
-                return [54 * 2**30, 54 * 2**30]
+                return available_memory
 
             def initialize_from_config(self, kv_cache_configs):
                 calls.append("workers_allocated")
@@ -706,17 +727,16 @@ class TestHybridCoordinatorHooks:
                 assert calls == [
                     "profiled_memory"
                 ], ("RPC must run after memory profiling and before allocate")
-                return [100, 100]
+                return [attn_num_blocks, attn_num_blocks]
 
         class FakeExecutor(MambaPoolSyncExecutorMixin, FakeBaseExecutor):
             pass
 
-        vllm_config.cache_config.num_gpu_blocks_override = None
         memory = FakeExecutor(vllm_config).determine_available_memory()
 
-        assert memory == [54 * 2**30, 54 * 2**30]
-        assert vllm_config.cache_config.num_gpu_blocks_override == 100
-        assert "workers_allocated" not in calls
+        assert memory == available_memory
+        assert vllm_config.cache_config.num_gpu_blocks_override == attn_num_blocks
+        assert calls == ["profiled_memory"]
 
     def test_tpu_get_kv_cache_coordinator_resolves_from_kv_cache_config(self):
         import tpu_inference.core.hybrid_coordinator as hc_mod
