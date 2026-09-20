@@ -686,6 +686,35 @@ def propagate_mamba_num_blocks(rpc_owner: Any, kv_cache_config: Any,
     return mamba_num_blocks
 
 
+def propagate_attn_num_blocks(rpc_owner: Any, vllm_config: Any) -> int | None:
+    """
+    Send attention pool block size from a worker (producer) to the engine core (consumer)
+    when they run in separate processes.
+    Return None when the model is an attention-only model
+    """
+    # Drop None values from workers skipping attention pool sizing
+    reported = [
+        v for v in rpc_owner.collective_rpc("get_attn_num_blocks")
+        if v is not None
+    ]
+
+    if not reported:
+        # pool size is None for attention-only model or when compact mamba pool sizing is not applied
+        return None
+
+    if len(set(reported)) != 1:
+        raise ValueError(
+            "[tpu_inference] Workers disagree on the attention pool "
+            f"size: {reported}. The scheduler cannot size its attention block "
+            "pool consistently.")
+    attn_num_blocks = int(reported[0])
+
+    # skip engine core write if user already set --num-gpu-blocks-override
+    if not vllm_config.cache_config.num_gpu_blocks_override:
+        vllm_config.cache_config.num_gpu_blocks_override = attn_num_blocks
+    return attn_num_blocks
+
+
 class MambaPoolSyncExecutorMixin:
     """Publish the workers' allocated mamba pool size in the engine-core
     process as soon as the caches exist: `initialize_from_config` runs there
@@ -696,6 +725,11 @@ class MambaPoolSyncExecutorMixin:
         if kv_cache_configs:
             propagate_mamba_num_blocks(self, kv_cache_configs[0],
                                        self.vllm_config)
+
+    def determine_available_memory(self) -> int:
+        available_memory = super().determine_available_memory()
+        propagate_attn_num_blocks(self, self.vllm_config)
+        return available_memory
 
 
 def maybe_install_hybrid_coordinator_hooks(vllm_config: Any) -> None:
