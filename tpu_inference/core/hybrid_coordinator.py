@@ -72,11 +72,6 @@ def get_mamba_num_blocks() -> int | None:
     return _GLOBAL_MAMBA_NUM_BLOCKS
 
 
-def get_attn_num_blocks(self) -> int | None:
-    """Return this worker's resolved attention block-pool capacity."""
-    return self.cache_config.num_gpu_blocks_override
-
-
 def mamba_blocks_per_request(vllm_config: Any,
                              is_align_mode: bool) -> tuple[int, int]:
     """Return `(min_blocks_per_req, blocks_per_req)` for the compact mamba pool.
@@ -692,9 +687,10 @@ def propagate_mamba_num_blocks(rpc_owner: Any, kv_cache_config: Any,
 
 
 def propagate_attn_num_blocks(rpc_owner: Any, vllm_config: Any) -> int | None:
-    """Fetch the attention pool size the workers planned (via `rpc_owner.collective_rpc`)
-    and publish it in the engine-core process. 
-    Returns None 
+    """Publish the worker-planned attention block count in EngineCore.
+
+    Returns None when EngineCore already has a user override or when no worker
+    reports an automatically planned attention pool.
     """
     cache_config = vllm_config.cache_config
     if cache_config.num_gpu_blocks_override is not None:
@@ -707,7 +703,7 @@ def propagate_attn_num_blocks(rpc_owner: Any, vllm_config: Any) -> int | None:
     ]
 
     if not reported:
-        # HBM profiling was skipped or the model is attention-only
+        # Pure-attention, pure-Mamba, and skipped-sizing workers report None.
         return None
 
     if len(set(reported)) != 1:
@@ -717,7 +713,7 @@ def propagate_attn_num_blocks(rpc_owner: Any, vllm_config: Any) -> int | None:
             "pool consistently.")
     attn_num_blocks = int(reported[0])
 
-    # skip engine core write if user already set --num-gpu-blocks-override
+    # Publish the worker consensus before EngineCore builds KV cache configs.
     vllm_config.cache_config.num_gpu_blocks_override = attn_num_blocks
     logger.info(
         "[tpu_inference] num_gpu_blocks_override=%d propagated from %d worker(s) "
