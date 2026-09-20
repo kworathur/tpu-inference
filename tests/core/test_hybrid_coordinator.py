@@ -616,6 +616,9 @@ class TestHybridCoordinatorHooks:
             propagate_mamba_num_blocks(engine_core, cfg, vllm_config)
         assert hc_mod.get_mamba_num_blocks() is None
 
+    def test_propagate_attn_num_blocks_publishes_worker_value(self):
+        pass
+
     def test_executor_mixin_publishes_after_workers_allocate(self):
         import tpu_inference.core.hybrid_coordinator as hc_mod
         from tpu_inference.core.hybrid_coordinator import \
@@ -649,6 +652,41 @@ class TestHybridCoordinatorHooks:
         assert cfg.mamba_num_blocks == 640
         assert vllm_config.cache_config.mamba_num_blocks == 640
         assert hc_mod.get_mamba_num_blocks() == 640
+
+    def test_executor_mixin_publishes_attn_before_workers_allocate(self):
+        from tpu_inference.core.hybrid_coordinator import \
+            MambaPoolSyncExecutorMixin
+        calls = []
+        vllm_config = _make_mock_vllm_config(dp_size=1, max_num_seqs=8)
+
+        class FakeBaseExecutor:
+
+            def __init__(self, vllm_config):
+                self.vllm_config = vllm_config
+
+            def determine_available_memory(self):
+                calls.append("profiled_memory")
+                return [54 * 2**30, 54 * 2**30]
+
+            def initialize_from_config(self, kv_cache_configs):
+                calls.append("workers_allocated")
+
+            def collective_rpc(self, method):
+                assert method == "get_attn_num_blocks"
+                assert calls == [
+                    "profiled_memory"
+                ], ("RPC must run after memory profiling and before allocate")
+                return [100, 100]
+
+        class FakeExecutor(MambaPoolSyncExecutorMixin, FakeBaseExecutor):
+            pass
+
+        vllm_config.cache_config.num_gpu_blocks_override = None
+        memory = FakeExecutor(vllm_config).determine_available_memory()
+
+        assert memory == [54 * 2**30, 54 * 2**30]
+        assert vllm_config.cache_config.num_gpu_blocks_override == 100
+        assert "workers_allocated" not in calls
 
     def test_tpu_get_kv_cache_coordinator_resolves_from_kv_cache_config(self):
         import tpu_inference.core.hybrid_coordinator as hc_mod
