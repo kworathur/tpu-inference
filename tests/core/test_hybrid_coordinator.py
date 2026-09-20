@@ -724,19 +724,22 @@ class TestHybridCoordinatorHooks:
 
             def collective_rpc(self, method):
                 assert method == "get_attn_num_blocks"
-                assert calls == [
-                    "profiled_memory"
-                ], ("RPC must run after memory profiling and before allocate")
+                calls.append("published_attn")
                 return [attn_num_blocks, attn_num_blocks]
 
         class FakeExecutor(MambaPoolSyncExecutorMixin, FakeBaseExecutor):
             pass
 
-        memory = FakeExecutor(vllm_config).determine_available_memory()
+        executor = FakeExecutor(vllm_config)
+
+        memory = executor.determine_available_memory()
+        executor.initialize_from_config([])
 
         assert memory == available_memory
         assert vllm_config.cache_config.num_gpu_blocks_override == attn_num_blocks
-        assert calls == ["profiled_memory"]
+        assert calls == [
+            "profiled_memory", "published_attn", "workers_allocated"
+        ]
 
     def test_tpu_get_kv_cache_coordinator_resolves_from_kv_cache_config(self):
         import tpu_inference.core.hybrid_coordinator as hc_mod
